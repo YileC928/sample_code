@@ -1,0 +1,244 @@
+---
+title: "R Code Sample"
+author: "Yile Chen"
+date: "12/13/2021"
+output:
+  pdf_document: 
+    latex_engine: xelatex
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data Construction
+
+```{r}
+library(tidyverse)
+library(zoo)
+library(dplyr)
+library(skimr)
+library(plm)
+library(foreign)
+library(xtable)
+library(AER)
+library(stats)
+library(sandwich)
+```
+
+### 1.a
+5331 observations are dropped in the first step and 8686 observations are dropped in the second step.
+```{r}
+ccm <- read.csv('ccm_10_19.csv')
+```
+
+```{r}
+ccm$year <- format(as.Date(as.character(ccm$datadate), format = "%Y%m%d"), "%Y") #extract year
+ccm_a1 <- ccm[!is.na(ccm$at),] #check NA prices
+dim(ccm)[1]-dim(ccm_a1)[1]
+```
+```{r}
+ccm_a2 <- ccm_a1[ccm_a1$fic == "USA",] #check FIC
+dim(ccm_a1)[1]-dim(ccm_a2)[1]
+```
+
+### 1.b
+BVPS here measures the amount of equity belong to preferred shareholders. we need to substract it from the calculation of BE because preferred shareholders are prioritized in claiming assets and earnings than common shareholders.
+
+```{r}
+ccm <- ccm_a2 %>% mutate(bvps = case_when(!is.na(ccm_a2$pstkrv) ~ ccm_a2$pstkrv, 
+       !is.na(ccm_a2$pstkl) ~ ccm_a2$pstkl, 
+       !is.na(ccm_a2$pstk) ~ ccm_a2$pstk,
+       TRUE ~ 0)) #calculate BVPS
+
+ccm$BE = ccm$seq + ccm$txditc - ccm$bvps #calculate book value of equity
+```
+
+
+### 1.c
+```{r}
+ccm <- ccm %>% mutate(lvg = dltt/at) #calculate leverage
+```
+
+```{r}
+ccm <- ccm %>% distinct(year, LPERMNO, .keep_all = TRUE)
+```
+
+
+### 1.d
+Net income, total dividends, and R&D expenses are represented by NI, DVT and XRD in the dataset.
+
+### 2.a
+12030 duplicates dropped.
+```{r}
+crsp <- read.csv('crsp_07_19.csv')
+crsp$year <- format(as.Date(as.character(crsp$date), format = "%Y%m%d"), "%Y") #extract year
+crsp$month <- format(as.Date(as.character(crsp$date), format = "%Y%m%d"), "%m") #extract month
+```
+
+```{r}
+crsp_a <- crsp %>% distinct(year, month, PERMNO, .keep_all = TRUE) #select distinct observations
+dim(crsp)[1] - dim(crsp_a)[1] #calculate duplicates
+```
+
+### 2.b
+Inspecting the summary statistics of the price, I find that around 2.77% of prices are negative. It is because that closing prices on those dates are not available. The price thus takes a value of the average of bid/ask prices, and a minus sign is put before the number to distinguish those price from real closing prices. 
+
+For this task, I took absolute value of the alternate price to solve the problem.
+```{r}
+summary(crsp_a$PRC)
+sum(crsp_a$PRC <= 0, na.rm=TRUE)/dim(crsp_a)[1]
+
+crsp <- crsp_a%>%
+  mutate(mktcap = abs(SHROUT * ALTPRC),
+         mktcap = if_else(mktcap == 0, as.numeric(NA), mktcap),
+         RET = as.numeric(RET),
+         VOL = as.numeric(VOL))
+```
+
+### 2.c
+```{r}
+crsp$rv = abs(crsp$RET)/crsp$VOL #add a column calculating |ret|/vol for each observation
+illiq <- crsp %>% group_by(year, PERMNO) %>% filter(PRC > 0) %>% #group by year and company and filter by price
+                  summarize(ILLIQ = mean(rv, na.rm = TRUE)) #aggregate by mean values
+head(illiq)
+crsp <- merge(crsp, illiq, by = c("year", "PERMNO"), all = TRUE) #merge to add illiq values to the CRSP dataset
+```
+
+### 2.d
+I used market equity at end of December of the year to represent annualized market equity.
+```{r}
+me <- crsp %>% group_by(year, PERMNO) %>% filter(month == 12) %>% 
+                summarize(ME = mean(mktcap, na.rm = TRUE)/1000) #build the ME variable
+crsp <- merge(crsp, me, by = c("year", "PERMNO"), all = TRUE) #merge to add ME to the CRSP dataset
+```
+
+```{r}
+#prepare a annual data set with selected variables
+crsp_short <- crsp %>% select(PERMNO, year, ME, ILLIQ, NAICS) %>% 
+                      distinct(year, PERMNO, .keep_all = TRUE) %>% filter(year > 2009)
+```
+
+
+### 3.a & 3.b
+For duplicate entries, I aggregate them by summing up their values. I end up with 223 unique industries.
+For 3b, I first extract the diagonal, divide it by T005 values then aggregate the results as I did in a.
+```{r}
+io <- read.csv("IO2012.csv")
+```
+```{r}
+io_a <- data.frame(colnames(io)[2:407], diag(as.matrix(io[, -1])), as.numeric(io[406, 2:407]))
+colnames(io_a) = c("code", "diag", "t005") #build a new df of code, diagnol values, and T005 values.
+io_a$share = io_a$diag/io_a$t005 #calculate within industry share
+io_b <- io_a %>% mutate(code = ifelse(substr(code, 1, 1) == "X", 
+                                      substr(code, 2, 5), 
+                                      substr(code, 1, 4))) %>% #transform to 4-digits
+                                      group_by(code) %>% 
+                                      summarize(share = sum(share, na.rm = TRUE)) #aggregate
+
+dim(io_b)[1]
+```
+
+
+
+### 4.a
+Around 21.94% of NAICS codes of the two datasets are different, and the CRSP dataset has less NA values for NAICS code. 
+I therefore decided to use the code in the CRSP dataset - labeled as "NAICS4".
+```{r}
+ccm$PERMNO = ccm$LPERMNO
+df <- merge(ccm, crsp_short, by=c("year", "PERMNO"), all = TRUE) #merge CCM and CRSP
+```
+
+```{r}
+#compare code of the CCM and CRSP
+df$naics4 = substr(df$naics,1,4)
+df$NAICS4 = substr(df$NAICS,1,4)
+sum(df$NAICS4 != df$naics4, na.rm = TRUE)/dim(df)[1]
+sum(is.na(df$NAICS4))
+sum(is.na(df$naics4))
+```
+
+```{r}
+df <- left_join(df, io_b, by = c("NAICS4" = "code"), keep = TRUE) #match within industry shares
+```
+
+### 4.b
+```{r}
+df$BM = df$BE/df$ME #create the book-to-market variable
+```
+
+```{r}
+#transform the merged dataframe into panel format.
+df_p <- pdata.frame(df, index = c("PERMNO","year"), drop.index = FALSE)
+```
+
+## Analaysis
+
+### 1.
+The summary statistics for book equity (BE), Leverage (lvg), market equity (ME), and book-to-market ratio (BM) are shown below.
+```{r}
+df_1 <- df %>% select(BE, lvg, ME, BM)
+summary(df_1)
+```
+
+### 2.
+The plot for distribution of R&D expenses among 2-digit NAICS industries is shown below. We can see that industries with 2-digit code ‘33’ has the highest R&D expenditure as a group.
+```{r}
+df_2012 <- df %>% filter(year == 2012)
+df_2012$NAICS2 = substr(df_2012$NAICS, 1, 2) #extract 2-digit
+df_2012 <- df_2012 %>% group_by(NAICS2) %>% summarise(XRD = sum(xrd, na.rm=TRUE)) #aggregate
+barplot(df_2012$XRD ~ df_2012$NAICS2, xlab = "2-digit Industry", ylab = "R&D expenditure")
+```
+
+### 3.
+### a).
+```{r}
+##pre-specify the models
+linear_model_ni = ni ~ lag(xrd, 1) + lag(xrd, 2) + lag(xrd, 3) + lag(xrd, 4) + lag(ni, 1) + lag(ME/1000, 1) + lag(BM, 1) + lag(lvg, 1) + lag(ILLIQ, 1)
+linear_model_dvt = dvt ~ lag(xrd, 1) + lag(xrd, 2) + lag(xrd, 3) + lag(xrd, 4) + lag(ni) + lag(ME/1000) + lag(BM) + lag(lvg) + lag(ILLIQ)
+```
+
+```{r}
+#OLS for net income
+ni_ols_fit   <- plm(linear_model_ni, df_p, model = "pooling", index = c("PERMNO","year"))
+summary(ni_ols_fit)
+```
+
+### b).
+```{r}
+#OLS for dividend
+dvt_ols_fit <- plm(linear_model_dvt, df_p, model = "pooling", index = c("PERMNO","year"))
+summary(dvt_ols_fit)
+```
+
+### c). add industry control
+```{r}
+#pre-specify the models
+linear_model_ni_ind = ni ~ lag(xrd, 1) + lag(xrd, 2) + lag(xrd, 3) + lag(xrd, 4) + lag(ni, 1) + lag(ME/1000000, 1) + lag(BM, 1) + lag(lvg, 1) + lag(ILLIQ, 1) + share
+linear_model_dvt_ind = dvt ~ lag(xrd, 1) + lag(xrd, 2) + lag(xrd, 3) + lag(xrd, 4) + lag(ni) + lag(ME/1000000) + lag(BM) + lag(lvg) + lag(ILLIQ) + share
+```
+
+```{r}
+#OLS with industry control for net income
+ni_ols_fit_ind <- plm(linear_model_ni_ind, df_p, model = "pooling", index = c("PERMNO","year"))
+summary(ni_ols_fit_ind)
+```
+
+```{r}
+#OLS with industry control for dividend
+dvt_ols_fit_ind <- plm(linear_model_dvt_ind, df_p, model = "pooling", index = c("PERMNO","year"))
+summary(ni_ols_fit_ind)
+```
+
+### d). Fix effect models:
+
+```{r}
+#fixed effect model for net income
+ni_fe_fit_ind <- plm(linear_model_ni_ind, df_p, model = "within", effect = "individual", index = c("PERMNO","year"))
+summary(ni_fe_fit_ind)
+```
+
+```{r}
+#fixed effect model for dividend
+dvt_fe_fit_ind <- plm(linear_model_dvt_ind, df_p, model = "within", effect = "individual", index = c("PERMNO","year"))
+summary(dvt_fe_fit_ind)
+```
